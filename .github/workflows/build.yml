@@ -3,11 +3,12 @@ name: Build Android APK
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
@@ -18,6 +19,7 @@ jobs:
         with:
           python-version: '3.10'
 
+      # 安装系统依赖，包括 libltdl-dev（解决 libffi 构建问题）
       - name: Install system dependencies
         run: |
           sudo apt update
@@ -27,48 +29,44 @@ jobs:
             autoconf libtool pkg-config \
             zlib1g-dev libncurses-dev \
             cmake libffi-dev libssl-dev \
-            wget
+            wget \
+            libltdl-dev   # 关键：解决 libtool 宏缺失问题
+          # 设置 aclocal 宏路径（确保找到 libtool 宏）
+          echo "ACLOCAL_PATH=/usr/share/aclocal:$ACLOCAL_PATH" >> $GITHUB_ENV
 
-      # 设置环境变量，让 sdkmanager 跳过 JDK 版本检查
-      - name: Set environment for sdkmanager
+      # 可选：跳过 JDK 版本检查（避免 buildozer 警告）
+      - name: Set JDK check skip
         run: echo "SKIP_JDK_VERSION_CHECK=true" >> $GITHUB_ENV
 
-      # ---------- 手动安装 Android SDK 组件 ----------
+      # 查找并使用预装的 Android SDK（GitHub runner 自带）
       - name: Install Android SDK components
         run: |
-          # 查找预装的 sdkmanager
           SDKMANAGER=$(find /usr/local/lib/android/sdk -name sdkmanager -type f | head -1)
           if [ -z "$SDKMANAGER" ]; then
             echo "❌ sdkmanager not found! GitHub runner may have changed." && exit 1
           fi
           echo "✅ Found sdkmanager at: $SDKMANAGER"
-
           # 自动接受所有许可证
           yes | $SDKMANAGER --licenses
-
-          # 安装所需的组件（每个包独立参数）
+          # 安装所需的组件
           $SDKMANAGER "platforms;android-33" "build-tools;34.0.0" "ndk;25.2.9519653"
           echo "✅ SDK components installed."
 
-      # ---------- 关键：创建符号链接以满足 Buildozer 的期望 ----------
+      # Buildozer 期望 sdkmanager 在 tools/bin/ 下，创建符号链接
       - name: Create symlink for old SDK tools path
         run: |
-          # 创建 Buildozer 期望的目录
           mkdir -p /usr/local/lib/android/sdk/tools/bin
-          # 找到真实的 sdkmanager 路径
           REAL_SDKMANAGER=$(find /usr/local/lib/android/sdk -name sdkmanager -type f | head -1)
           ln -sf "$REAL_SDKMANAGER" /usr/local/lib/android/sdk/tools/bin/sdkmanager
-          echo "✅ Created symlink: /usr/local/lib/android/sdk/tools/bin/sdkmanager"
-
-          # 为其他常用工具也创建链接（可选，但以防万一）
           for tool in avdmanager lint; do
             REAL_TOOL=$(find /usr/local/lib/android/sdk -name $tool -type f | head -1)
             if [ -n "$REAL_TOOL" ]; then
               ln -sf "$REAL_TOOL" "/usr/local/lib/android/sdk/tools/bin/$tool"
             fi
           done
+          echo "✅ Created symlinks."
 
-      # 设置 SDK/NDK 环境变量（多个变量确保 Buildozer 能识别）
+      # 设置环境变量
       - name: Set environment variables for SDK/NDK
         run: |
           echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
@@ -76,35 +74,40 @@ jobs:
           echo "ANDROIDSDK=/usr/local/lib/android/sdk" >> $GITHUB_ENV
           echo "ANDROIDNDK=/usr/local/lib/android/sdk/ndk/25.2.9519653" >> $GITHUB_ENV
           echo "ANDROID_NDK=/usr/local/lib/android/sdk/ndk/25.2.9519653" >> $GITHUB_ENV
-          # 将所有可能需要的工具目录加入 PATH
           echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH
           echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "/usr/local/lib/android/sdk/tools/bin" >> $GITHUB_PATH
           echo "/usr/local/lib/android/sdk/build-tools/34.0.0" >> $GITHUB_PATH
 
+      # 安装 Python 依赖
       - name: Install Python dependencies
-        run: |
-          pip install --user buildozer cython==0.29.33
+        run: pip install --user buildozer cython==0.29.33
 
-      - name: Cache buildozer directory (optional)
+      # 尝试恢复缓存（可选）
+      - name: Cache Buildozer directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('**/*.spec') }}
 
-      - name: Prepare environment for Buildozer (clean Buildozer's own SDK)
+      # 彻底清理 Buildozer 可能自建的 SDK/NDK（避免干扰）
+      - name: Clean Buildozer's private SDK/NDK
         run: |
-          # 彻底删除 Buildozer 可能自建的 SDK 和 NDK
           rm -rf ~/.buildozer/android/platform/android-sdk
           rm -rf ~/.buildozer/android/platform/android-ndk-r25b
           echo "✅ Cleared Buildozer's private SDK/NDK."
 
-      - name: Build with buildozer
-        run: |
-          buildozer android debug
+      # 关键修复：清理 Buildozer 整个缓存（可选，确保从头开始）
+      - name: (Optional) Clear full Buildozer cache
+        run: rm -rf ~/.buildozer
 
-      - name: Upload APK artifact
+      # 执行构建
+      - name: Build APK with Buildozer
+        run: buildozer android debug
+
+      # 上传生成的 APK 作为 artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
+          name: app-debug
           path: bin/*.apk
