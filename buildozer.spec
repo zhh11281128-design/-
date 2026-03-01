@@ -5,7 +5,7 @@ title = 记账软件
 
 # 包名（必须唯一，请将 "org.example" 替换为你自己的域名，如 "com.yourname"）
 package.name = accountbook
-package.domain = org.example
+package.domain = com.xs.accountbook
 
 # 源代码目录
 source.dir = .
