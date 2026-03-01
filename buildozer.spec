@@ -5,8 +5,10 @@ title = 记账软件
 
 # (str) 包名（必须唯一，请将 org.example 改为你自己的域名）
 package.name = accountbook
-package.domain = org.example   # 例如改为 com.zhh11281128
+package.domain =com.zhh11281128
 
+android.sdk_path = /usr/local/lib/android/sdk
+android.ndk_path = /usr/local/lib/android/sdk/ndk/25.2.9519653
 # (str) 应用版本号
 version = 0.1
 
