@@ -33,30 +33,13 @@ jobs:
         run: |
           pip install --user buildozer cython==0.29.33
 
-      # ---------- 手动安装 Android SDK 并接受所有许可证 ----------
-      - name: Setup Android SDK and accept licenses
-        run: |
-          export ANDROID_SDK_ROOT=$HOME/android-sdk
-          # 创建目标目录结构
-          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
-          cd $ANDROID_SDK_ROOT
-          # 下载命令行工具（使用稳定版）
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-          # 解压到临时目录
-          unzip -q commandlinetools-linux-9477386_latest.zip -d tmp
-          # 将解压出的内容移动到正确的路径
-          mv tmp/cmdline-tools/* cmdline-tools/latest/
-          # 清理临时文件
-          rm -rf tmp
-          # 将 sdkmanager 加入 PATH
-          export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
-          # 自动接受所有 SDK 许可证
-          yes | sdkmanager --licenses
-          # 安装必要的平台和构建工具（与 buildozer.spec 一致）
-          sdkmanager "platform-tools" "platforms;android-33" "build-tools;34.0.0"
-          # 设置环境变量，让后续步骤（包括 Buildozer）能直接使用此 SDK
-          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+      # ---------- 使用官方 Action 安装 Android SDK 和 NDK ----------
+      - name: Setup Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 33                  # 与 buildozer.spec 中的 android.api 一致
+          build-tools: 34.0.0             # 与 buildozer.spec 中的 android.build_tools 一致
+          ndk: 25.2.9519653               # NDK 版本 25b 对应的具体版本号
 
       # 缓存 Buildozer 目录（加速后续构建）
       - name: Cache buildozer directory
@@ -65,7 +48,6 @@ jobs:
           path: ~/.buildozer
           key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
-      # Buildozer 现在会使用已存在的 SDK（ANDROIDSDK 已设置），不会再尝试下载
       - name: Build with buildozer
         run: |
           buildozer android debug
