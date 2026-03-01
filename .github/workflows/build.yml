@@ -28,19 +28,22 @@ jobs:
             cmake libffi-dev libssl-dev \
             wget
 
-      # 关键：使用 Java 8 来运行 sdkmanager（JAXB 问题）
+      # 使用 Java 8 来运行 sdkmanager（解决 JAXB 问题）
       - name: Set up JDK 8
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '8'
 
+      # 使用最新版本的 setup-android，通过 packages 安装指定组件
       - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
-          api-level: 33
-          build-tools: 34.0.0
-          ndk: 25.2.9519653
+          packages: |
+            platforms;android-33
+            build-tools;34.0.0
+            ndk;25.2.9519653
+          accept-android-sdk-licenses: true
 
       - name: Install Python dependencies
         run: |
