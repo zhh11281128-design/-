@@ -1,71 +1,18 @@
-name: Build Android APK
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            git zip unzip \
-            openjdk-17-jdk \
-            autoconf libtool pkg-config \
-            zlib1g-dev libncurses-dev \
-            cmake libffi-dev libssl-dev \
-            wget
-
-      - name: Install Python dependencies
-        run: |
-          pip install --user buildozer cython==0.29.33
-
-      # ---------- 使用官方 Action 安装 Android SDK 和 NDK ----------
-      - name: Setup Android SDK and NDK
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 33
-          build-tools: 34.0.0
-          ndk: 25.2.9519653   # 对应 NDK 25b 的具体版本
-
-      # 缓存 Buildozer 目录（加速后续构建）
-      - name: Cache buildozer directory
-        uses: actions/cache@v4
-        with:
-          path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
-
-      # ---------- 关键步骤：设置正确 SDK 路径并清理 Buildozer 默认目录 ----------
       - name: Prepare environment for Buildozer
         run: |
-          # 删除 Buildozer 可能自建的 SDK 目录，强制使用系统 SDK
+          # 彻底删除 Buildozer 可能自建的 SDK 目录，强制其使用系统 SDK
           rm -rf ~/.buildozer/android/platform/android-sdk
           rm -rf ~/.buildozer/android/platform/android-ndk-r25b
-          # 设置环境变量，指向由 setup-android 安装的 SDK 和 NDK
-          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROIDNDK=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
-          echo "Using SDK: $ANDROID_SDK_ROOT"
-          echo "Using NDK: $ANDROID_SDK_ROOT/ndk/25.2.9519653"
-
-      - name: Build with buildozer
-        run: |
-          buildozer android debug
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-apk
-          path: bin/*.apk
+          # 设置所有相关环境变量，确保 Buildozer 能找到系统 SDK/NDK
+          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+          echo "ANDROIDSDK=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+          echo "ANDROIDNDK=/usr/local/lib/android/sdk/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK=/usr/local/lib/android/sdk/ndk/25.2.9519653" >> $GITHUB_ENV
+          # 将 SDK 工具加入 PATH（可选）
+          echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH
+          echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          # 验证路径
+          echo "SDK location: $ANDROID_SDK_ROOT"
+          echo "NDK location: $ANDROID_NDK"
+          ls -l $ANDROID_SDK_ROOT/build-tools || echo "build-tools not found, but setup-android should have installed it"
