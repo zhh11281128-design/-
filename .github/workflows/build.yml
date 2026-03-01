@@ -33,21 +33,27 @@ jobs:
         run: |
           pip install --user buildozer cython==0.29.33
 
-      # ---------- 使用官方 Action 安装 Android SDK 和 NDK ----------
       - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
-          api-level: 33                  # 与 buildozer.spec 中的 android.api 一致
-          build-tools: 34.0.0             # 与 buildozer.spec 中的 android.build_tools 一致
-          ndk: 25.2.9519653               # NDK 版本 25b 对应的具体版本号
+          api-level: 33                  # 与 buildozer.spec 匹配
+          build-tools: 34.0.0            # 与 buildozer.spec 匹配
+          ndk: 25.2.9519653              # 与 buildozer.spec 匹配
 
-      # 缓存 Buildozer 目录（加速后续构建）
       - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
           key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
+      # 关键修复步骤，确保 AIDL/build-tools 可用 
+      - name: Ensure Build-tools and AIDL available for Buildozer
+        run: |
+          yes | sdkmanager --install "build-tools;34.0.0"
+          mkdir -p ~/.buildozer/android/platform/android-sdk/build-tools
+          cp -r $ANDROID_SDK_ROOT/build-tools/34.0.0 ~/.buildozer/android/platform/android-sdk/build-tools/ || true
+          ls ~/.buildozer/android/platform/android-sdk/build-tools/34.0.0/
+      
       - name: Build with buildozer
         run: |
           buildozer android debug
