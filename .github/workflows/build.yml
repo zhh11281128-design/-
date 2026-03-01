@@ -27,21 +27,50 @@ jobs:
             autoconf libtool pkg-config \
             zlib1g-dev libncurses-dev \
             cmake libffi-dev libssl-dev \
-            python3-pip
+            wget
 
       - name: Install Python dependencies
         run: |
           pip install --user buildozer cython==0.29.33
-      - name: Accept Android SDK licenses
-        run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
+      # ---------- 手动安装 Android SDK 并接受所有许可证 ----------
+      - name: Setup Android SDK and accept licenses
+        run: |
+          # 创建 SDK 目录
+          mkdir -p $HOME/android-sdk
+          cd $HOME/android-sdk
+
+          # 下载命令行工具（使用最新稳定版）
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+          unzip -q commandlinetools-linux-9477386_latest.zip
+
+          # 整理目录结构（使 sdkmanager 在标准路径）
+          mkdir -p cmdline-tools
+          mv cmdline-tools cmdline-tools/latest
+
+          # 设置环境变量
+          export ANDROID_SDK_ROOT=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
+
+          # 接受所有 SDK 许可证（自动输入 yes）
+          yes | sdkmanager --licenses
+
+          # 安装需要的 platform 和 build-tools（与 buildozer.spec 一致）
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;34.0.0"
+
+          # 将 SDK 路径写入环境变量，供后续步骤使用
+          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          # 可选：将 sdkmanager 加入 PATH
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+
+      # 缓存 Buildozer 目录（加速后续构建）
       - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
           key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
+      # Buildozer 现在会使用已存在的 SDK（ANDROIDSDK 已设置），不会再尝试下载
       - name: Build with buildozer
         run: |
           buildozer android debug
