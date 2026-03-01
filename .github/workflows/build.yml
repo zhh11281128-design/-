@@ -32,6 +32,9 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --user buildozer cython==0.29.33
+      - name: Accept Android SDK licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Cache buildozer directory
         uses: actions/cache@v4
