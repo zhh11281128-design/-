@@ -29,7 +29,7 @@ android.api = 33
 android.minapi = 21
 android.ndk = 25b
 android.sdk = 34
-
+android.build_tools = 34.0.0
 # 如果你的应用使用中文，可能需要设置默认编码
 android.add_src =
 
