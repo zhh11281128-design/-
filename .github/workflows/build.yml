@@ -33,44 +33,34 @@ jobs:
         run: |
           pip install --user buildozer cython==0.29.33
 
+      # ---------- 使用官方 Action 安装 Android SDK 和 NDK ----------
       - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
           api-level: 33
           build-tools: 34.0.0
-          ndk: 25.2.9519653
+          ndk: 25.2.9519653   # 对应 NDK 25b 的具体版本
 
+      # 缓存 Buildozer 目录（加速后续构建）
       - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
           key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
-      - name: Setup Android SDK paths for Buildozer
+      # ---------- 关键步骤：设置正确 SDK 路径并清理 Buildozer 默认目录 ----------
+      - name: Prepare environment for Buildozer
         run: |
-          # 创建 buildozer 期望的 SDK 目录结构
-          mkdir -p ~/.buildozer/android/platform/android-sdk/tools/bin
-          mkdir -p ~/.buildozer/android/platform/android-sdk/build-tools
-          
-          # 使用 ANDROID_SDK_ROOT 中的 sdkmanager
-          if [ -f "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ~/.buildozer/android/platform/android-sdk/tools/bin/sdkmanager
-            echo "Created symlink for sdkmanager"
-          fi
-          
-          # 安装必要的构建工具
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" || true
-          
-          # 复制构建工具到 buildozer 目录
-          cp -r "$ANDROID_SDK_ROOT/build-tools/34.0.0" ~/.buildozer/android/platform/android-sdk/build-tools/ || true
-          
-          # 验证文件存在
-          ls -la ~/.buildozer/android/platform/android-sdk/build-tools/34.0.0/ || echo "Build tools not found"
+          # 删除 Buildozer 可能自建的 SDK 目录，强制使用系统 SDK
+          rm -rf ~/.buildozer/android/platform/android-sdk
+          rm -rf ~/.buildozer/android/platform/android-ndk-r25b
+          # 设置环境变量，指向由 setup-android 安装的 SDK 和 NDK
+          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROIDNDK=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "Using SDK: $ANDROID_SDK_ROOT"
+          echo "Using NDK: $ANDROID_SDK_ROOT/ndk/25.2.9519653"
 
       - name: Build with buildozer
-        env:
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
         run: |
           buildozer android debug
 
