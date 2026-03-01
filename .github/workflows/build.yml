@@ -36,31 +36,26 @@ jobs:
       # ---------- 手动安装 Android SDK 并接受所有许可证 ----------
       - name: Setup Android SDK and accept licenses
         run: |
-          # 创建 SDK 目录
-          mkdir -p $HOME/android-sdk
-          cd $HOME/android-sdk
-
-          # 下载命令行工具（使用最新稳定版）
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-          unzip -q commandlinetools-linux-9477386_latest.zip
-
-          # 整理目录结构（使 sdkmanager 在标准路径）
-          mkdir -p cmdline-tools
-          mv cmdline-tools cmdline-tools/latest
-
-          # 设置环境变量
           export ANDROID_SDK_ROOT=$HOME/android-sdk
+          # 创建目标目录结构
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
+          cd $ANDROID_SDK_ROOT
+          # 下载命令行工具（使用稳定版）
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+          # 解压到临时目录
+          unzip -q commandlinetools-linux-9477386_latest.zip -d tmp
+          # 将解压出的内容移动到正确的路径
+          mv tmp/cmdline-tools/* cmdline-tools/latest/
+          # 清理临时文件
+          rm -rf tmp
+          # 将 sdkmanager 加入 PATH
           export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
-
-          # 接受所有 SDK 许可证（自动输入 yes）
+          # 自动接受所有 SDK 许可证
           yes | sdkmanager --licenses
-
-          # 安装需要的 platform 和 build-tools（与 buildozer.spec 一致）
+          # 安装必要的平台和构建工具（与 buildozer.spec 一致）
           sdkmanager "platform-tools" "platforms;android-33" "build-tools;34.0.0"
-
-          # 将 SDK 路径写入环境变量，供后续步骤使用
+          # 设置环境变量，让后续步骤（包括 Buildozer）能直接使用此 SDK
           echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          # 可选：将 sdkmanager 加入 PATH
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
 
       # 缓存 Buildozer 目录（加速后续构建）
