@@ -1,8 +1,9 @@
 import datetime
 import os
-os.environ['KIVY_GL_BACKEND'] = 'angle_sdl2'
 import sys
 import sqlite3
+import logging
+import re
 from openpyxl import Workbook, load_workbook
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
@@ -17,26 +18,57 @@ from kivy.resources import resource_add_path, resource_find
 from kivy.metrics import dp
 from plyer import filechooser
 
-# ----- 解决中文显示问题（自动定位字体文件）-----
+# ----- 日志配置 -----
+logging.basicConfig(
+    filename='app.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ----- 颜色常量（便于主题调整）-----
+COLOR_GREEN = (0.2, 0.7, 0.2, 1)
+COLOR_BLUE = (0.3, 0.6, 0.9, 1)
+COLOR_RED = (0.9, 0.2, 0.2, 1)
+COLOR_GRAY = (0.7, 0.7, 0.7, 1)
+COLOR_DARK_GRAY = (0.5, 0.5, 0.5, 1)
+
+# ----- 解决中文显示问题（增强字体后备）-----
 def setup_chinese_font():
-    """自动检测并注册中文字体，支持打包后的资源访问"""
-    possible_paths = [
-        os.path.join(os.path.dirname(__file__), 'simhei.ttf'),
-        os.path.join(getattr(sys, '_MEIPASS', ''), 'simhei.ttf'),
-        resource_find('simhei.ttf')
+    """自动检测并注册中文字体，支持多个备选字体"""
+    # 常见中文字体文件名列表
+    font_candidates = [
+        'simhei.ttf',          # 黑体
+        'msyh.ttf',            # 微软雅黑
+        'simsun.ttc',          # 宋体
+        'NotoSansCJK-Regular.ttc'  # 思源黑体
+    ]
+    # 可能的搜索路径
+    search_paths = [
+        os.path.dirname(__file__),
+        getattr(sys, '_MEIPASS', ''),
     ]
     font_path = None
-    for p in possible_paths:
-        if p and os.path.exists(p):
-            font_path = p
+    for path in search_paths:
+        for font in font_candidates:
+            full_path = os.path.join(path, font)
+            if os.path.exists(full_path):
+                font_path = full_path
+                break
+        if font_path:
             break
+    # 如果未找到，尝试 resource_find
     if not font_path:
-        raise FileNotFoundError(
-            "字体文件 simhei.ttf 不存在，请将其放在程序目录下，"
-            "或确保打包时已包含。"
-        )
-    LabelBase.register(name='SimHei', fn_regular=font_path)
-    LabelBase.register(name=DEFAULT_FONT, fn_regular=font_path)
+        for font in font_candidates:
+            res_path = resource_find(font)
+            if res_path:
+                font_path = res_path
+                break
+    if font_path:
+        LabelBase.register(name='SimHei', fn_regular=font_path)
+        LabelBase.register(name=DEFAULT_FONT, fn_regular=font_path)
+    else:
+        # 无中文字体时使用默认字体（可能显示为方块，但程序继续运行）
+        print("警告：未找到中文字体，中文可能显示异常")
 
 setup_chinese_font()
 
@@ -62,8 +94,50 @@ CREATE_TABLE_SQL = f'''
 '''
 CREATE_INDEX_SQL = f'CREATE INDEX IF NOT EXISTS idx_date ON {TABLE_NAME}(date);'
 
+# ---------- 辅助函数 ----------
+def sanitize_filename(name):
+    """替换文件名中的非法字符为下划线"""
+    return re.sub(r'[\\/*?:"<>|]', '_', name)
 
-# ---------- 数据库初始化辅助函数 ----------
+def parse_date_cell(date_cell):
+    """
+    将 Excel 中的日期单元格转换为标准 'YYYY-MM-DD' 字符串。
+    支持 datetime 对象、字符串和数字。
+    返回 None 表示无效日期。
+    """
+    if date_cell is None:
+        return None
+    if isinstance(date_cell, datetime.datetime):
+        return date_cell.strftime('%Y-%m-%d')
+    if isinstance(date_cell, str):
+        # 取前10个字符，并尝试解析
+        s = date_cell.strip()[:10]
+        try:
+            datetime.datetime.strptime(s, '%Y-%m-%d')
+            return s
+        except ValueError:
+            # 尝试其他常见格式
+            for fmt in ('%Y/%m/%d', '%d-%m-%Y', '%d/%m/%Y'):
+                try:
+                    dt = datetime.datetime.strptime(s, fmt)
+                    return dt.strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+        return None
+    if isinstance(date_cell, (int, float)):
+        # 处理 Excel 序列日期（简单假设为 1900 系统）
+        try:
+            # 仅当数字较大时认为是序列日期
+            if date_cell > 10000:
+                # Excel 的 1900 日期系统，注意 1900-02-29 的 bug 此处忽略
+                base_date = datetime.datetime(1899, 12, 30)
+                delta = datetime.timedelta(days=date_cell)
+                dt = base_date + delta
+                return dt.strftime('%Y-%m-%d')
+        except:
+            pass
+    return None
+
 def init_database(db_path):
     """如果数据库不存在，则创建表并建立索引"""
     conn = sqlite3.connect(db_path)
@@ -73,6 +147,151 @@ def init_database(db_path):
     conn.commit()
     conn.close()
 
+# ---------- 自定义日期选择控件（简化版）----------
+class DateSelector(BoxLayout):
+    """
+    根据查询类型动态生成日期选择器。
+    通过 get_date_range() 返回 (start_date, end_date) 元组，
+    对于天和月、年，end_date 可能为 None 或计算得出。
+    使用方法：绑定 type 属性变化或直接调用 set_type(type_str)
+    """
+    def __init__(self, query_type='天', **kwargs):
+        super().__init__(orientation='vertical', size_hint_y=None, spacing=dp(2), **kwargs)
+        self.query_type = query_type
+        self.spinners = {}
+        self.build()
+
+    def build(self):
+        self.clear_widgets()
+        self.spinners.clear()
+
+        now = datetime.datetime.now()
+        current_year = now.year if START_YEAR <= now.year <= END_YEAR else START_YEAR
+        current_month = now.month
+        current_day = now.day
+
+        spinner_style = {
+            'size_hint_y': None,
+            'height': dp(30),
+            'font_size': dp(12)
+        }
+
+        if self.query_type == '天':
+            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
+            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.33, **spinner_style)
+            h_layout.add_widget(year_sp)
+            self.spinners['year'] = year_sp
+
+            months = [f"{m:02d}" for m in range(1, 13)]
+            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.33, **spinner_style)
+            h_layout.add_widget(month_sp)
+            self.spinners['month'] = month_sp
+
+            days = [f"{d:02d}" for d in range(1, 32)]
+            day_sp = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.33, **spinner_style)
+            h_layout.add_widget(day_sp)
+            self.spinners['day'] = day_sp
+            self.add_widget(h_layout)
+
+        elif self.query_type == '月':
+            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
+            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.5, **spinner_style)
+            h_layout.add_widget(year_sp)
+            self.spinners['year'] = year_sp
+
+            months = [f"{m:02d}" for m in range(1, 13)]
+            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.5, **spinner_style)
+            h_layout.add_widget(month_sp)
+            self.spinners['month'] = month_sp
+            self.add_widget(h_layout)
+
+        elif self.query_type == '年':
+            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30))
+            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=1, **spinner_style)
+            h_layout.add_widget(year_sp)
+            self.spinners['year'] = year_sp
+            self.add_widget(h_layout)
+
+        elif self.query_type == '时间段':
+            # 起始日期
+            start_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
+            start_layout.add_widget(Label(text='从', size_hint_x=0.08, font_size=dp(12), halign='center'))
+            start_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
+            start_layout.add_widget(start_year)
+            self.spinners['start_year'] = start_year
+
+            months = [f"{m:02d}" for m in range(1, 13)]
+            start_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
+            start_layout.add_widget(start_month)
+            self.spinners['start_month'] = start_month
+
+            days = [f"{d:02d}" for d in range(1, 32)]
+            start_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
+            start_layout.add_widget(start_day)
+            self.spinners['start_day'] = start_day
+            self.add_widget(start_layout)
+
+            # 结束日期
+            end_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
+            end_layout.add_widget(Label(text='到', size_hint_x=0.08, font_size=dp(12), halign='center'))
+            end_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
+            end_layout.add_widget(end_year)
+            self.spinners['end_year'] = end_year
+
+            end_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
+            end_layout.add_widget(end_month)
+            self.spinners['end_month'] = end_month
+
+            end_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
+            end_layout.add_widget(end_day)
+            self.spinners['end_day'] = end_day
+            self.add_widget(end_layout)
+
+    def set_type(self, query_type):
+        if query_type != self.query_type:
+            self.query_type = query_type
+            self.build()
+
+    def get_date_range(self):
+        """
+        返回 (start_date, end_date) 字符串。
+        对于 '天'，end_date = start_date。
+        对于 '月' 和 '年'，end_date 为下一天的开始（用于 date < end_date 查询）。
+        """
+        try:
+            if self.query_type == '天':
+                year = self.spinners['year'].text
+                month = self.spinners['month'].text
+                day = self.spinners['day'].text
+                start = f"{year}-{month}-{day}"
+                return start, start
+            elif self.query_type == '月':
+                year = self.spinners['year'].text
+                month = self.spinners['month'].text
+                start = f"{year}-{month}-01"
+                if month == '12':
+                    end = f"{int(year)+1}-01-01"
+                else:
+                    end = f"{year}-{int(month)+1:02d}-01"
+                return start, end
+            elif self.query_type == '年':
+                year = self.spinners['year'].text
+                start = f"{year}-01-01"
+                end = f"{int(year)+1}-01-01"
+                return start, end
+            elif self.query_type == '时间段':
+                sy = self.spinners['start_year'].text
+                sm = self.spinners['start_month'].text
+                sd = self.spinners['start_day'].text
+                ey = self.spinners['end_year'].text
+                em = self.spinners['end_month'].text
+                ed = self.spinners['end_day'].text
+                start = f"{sy}-{sm}-{sd}"
+                end = f"{ey}-{em}-{ed}"
+                return start, end
+        except KeyError as e:
+            raise ValueError(f"日期控件未完整初始化：{e}")
+        return None, None
 
 # ---------- 主界面 ----------
 class MainScreen(Screen):
@@ -80,7 +299,6 @@ class MainScreen(Screen):
         super().__init__(**kwargs)
         layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(10))
 
-        # 标题（显示当前账单名）
         self.title_label = Label(
             text='我的记账本',
             size_hint_y=0.12,
@@ -89,7 +307,7 @@ class MainScreen(Screen):
         )
         layout.add_widget(self.title_label)
 
-        # 账单选择下拉列表（仅显示名称，无后缀）
+        # 账单选择下拉列表
         bill_select_layout = BoxLayout(size_hint_y=0.08, spacing=dp(5))
         bill_select_layout.add_widget(Label(text='选择账单：', size_hint_x=0.25, font_size=dp(14)))
         self.bill_spinner = Spinner(
@@ -102,11 +320,11 @@ class MainScreen(Screen):
         bill_select_layout.add_widget(self.bill_spinner)
         layout.add_widget(bill_select_layout)
 
-        # 三个操作按钮：新建、重命名、删除
+        # 三个操作按钮
         btn_layout = BoxLayout(size_hint_y=0.1, spacing=dp(10))
         new_btn = Button(
             text='新建',
-            background_color=(0.2, 0.7, 0.2, 1),
+            background_color=COLOR_GREEN,
             font_size=dp(14)
         )
         new_btn.bind(on_press=self.new_bill_popup)
@@ -114,7 +332,7 @@ class MainScreen(Screen):
 
         rename_btn = Button(
             text='重命名',
-            background_color=(0.3, 0.6, 0.9, 1),
+            background_color=COLOR_BLUE,
             font_size=dp(14)
         )
         rename_btn.bind(on_press=self.rename_bill_popup)
@@ -122,18 +340,17 @@ class MainScreen(Screen):
 
         delete_btn = Button(
             text='删除',
-            background_color=(0.9, 0.2, 0.2, 1),
+            background_color=COLOR_RED,
             font_size=dp(14)
         )
         delete_btn.bind(on_press=self.delete_bill_popup)
         btn_layout.add_widget(delete_btn)
-
         layout.add_widget(btn_layout)
 
         # 功能按钮
         view_btn = Button(
             text='查看事件',
-            background_color=(0.3, 0.6, 0.9, 1),
+            background_color=COLOR_BLUE,
             size_hint_y=0.12
         )
         view_btn.bind(on_press=self.go_to_view_event)
@@ -149,23 +366,23 @@ class MainScreen(Screen):
 
         import_btn = Button(
             text='导入 Excel',
-            background_color=(0.5, 0.5, 0.5, 1),
+            background_color=COLOR_DARK_GRAY,
             size_hint_y=0.12
         )
-        import_btn.bind(on_press=self.on_import)
+        import_btn.bind(on_press=self.go_to_import)
         layout.add_widget(import_btn)
 
         export_btn = Button(
             text='导出 Excel',
-            background_color=(0.5, 0.5, 0.5, 1),
+            background_color=COLOR_DARK_GRAY,
             size_hint_y=0.12
         )
-        export_btn.bind(on_press=self.on_export)
+        export_btn.bind(on_press=self.go_to_export)
         layout.add_widget(export_btn)
 
         exit_btn = Button(
             text='退出该应用',
-            background_color=(0.9, 0.2, 0.2, 1),
+            background_color=COLOR_RED,
             size_hint_y=0.12,
             font_size=dp(16)
         )
@@ -175,28 +392,22 @@ class MainScreen(Screen):
         self.add_widget(layout)
 
     def on_enter(self):
-        """每次进入主界面时刷新账单列表和当前显示"""
         app = App.get_running_app()
         app.refresh_bill_list()
-        # 更新下拉列表（显示无后缀名）
         display_names = [os.path.splitext(name)[0] for name in app.bill_files]
         self.bill_spinner.values = display_names
-        # 设置当前选中项
         if app.current_bill:
             current_display = os.path.splitext(app.current_bill)[0]
             self.bill_spinner.text = current_display
             self.update_title(current_display)
 
     def update_title(self, display_name):
-        """更新标题显示，格式：我的记账本 - 账单名"""
         self.title_label.text = f'我的记账本 - {display_name}'
 
     def on_bill_change(self, spinner, text):
-        """当下拉列表选择变化时，根据显示名称找到对应的真实文件名并切换"""
         if not text:
             return
         app = App.get_running_app()
-        # 根据显示名称找到对应的真实文件名（带后缀）
         for filename in app.bill_files:
             if os.path.splitext(filename)[0] == text:
                 if app.current_bill != filename:
@@ -205,7 +416,6 @@ class MainScreen(Screen):
                 break
 
     def new_bill_popup(self, instance):
-        """弹出新建账单的输入窗口"""
         content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
         content.add_widget(Label(text='请输入新账单名称：'))
         name_input = TextInput(hint_text='例如：2025年家庭账本', multiline=False)
@@ -213,7 +423,7 @@ class MainScreen(Screen):
 
         btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
         cancel_btn = Button(text='取消')
-        ok_btn = Button(text='确定', background_color=(0.2, 0.7, 0.2, 1))
+        ok_btn = Button(text='确定', background_color=COLOR_GREEN)
         btn_layout.add_widget(cancel_btn)
         btn_layout.add_widget(ok_btn)
         content.add_widget(btn_layout)
@@ -221,11 +431,10 @@ class MainScreen(Screen):
         popup = Popup(title='新建账单', content=content, size_hint=(0.8, 0.4))
 
         def on_ok(btn):
-            name = name_input.text.strip()
+            raw_name = name_input.text.strip()
             app = App.get_running_app()
-            success, msg = app.create_new_bill(name)
+            success, msg = app.create_new_bill(raw_name)
             if success:
-                # 刷新下拉列表
                 display_names = [os.path.splitext(name)[0] for name in app.bill_files]
                 self.bill_spinner.values = display_names
                 current_display = os.path.splitext(app.current_bill)[0]
@@ -240,7 +449,6 @@ class MainScreen(Screen):
         popup.open()
 
     def rename_bill_popup(self, instance):
-        """弹出重命名账单的输入窗口"""
         app = App.get_running_app()
         if not app.current_bill:
             return
@@ -254,7 +462,7 @@ class MainScreen(Screen):
 
         btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
         cancel_btn = Button(text='取消')
-        ok_btn = Button(text='确定', background_color=(0.3, 0.6, 0.9, 1))
+        ok_btn = Button(text='确定', background_color=COLOR_BLUE)
         btn_layout.add_widget(cancel_btn)
         btn_layout.add_widget(ok_btn)
         content.add_widget(btn_layout)
@@ -269,7 +477,6 @@ class MainScreen(Screen):
             app = App.get_running_app()
             success, msg = app.rename_current_bill(new_name)
             if success:
-                # 刷新下拉列表
                 display_names = [os.path.splitext(name)[0] for name in app.bill_files]
                 self.bill_spinner.values = display_names
                 current_display = os.path.splitext(app.current_bill)[0]
@@ -284,7 +491,6 @@ class MainScreen(Screen):
         popup.open()
 
     def delete_bill_popup(self, instance):
-        """弹出删除账单确认窗口，要求输入'删除'二字确认"""
         app = App.get_running_app()
         if not app.current_bill:
             return
@@ -301,7 +507,7 @@ class MainScreen(Screen):
 
         btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
         cancel_btn = Button(text='取消')
-        ok_btn = Button(text='确认删除', background_color=(0.9, 0.2, 0.2, 1))
+        ok_btn = Button(text='确认删除', background_color=COLOR_RED)
         btn_layout.add_widget(cancel_btn)
         btn_layout.add_widget(ok_btn)
         content.add_widget(btn_layout)
@@ -313,7 +519,6 @@ class MainScreen(Screen):
                 app = App.get_running_app()
                 success, msg = app.delete_current_bill()
                 if success:
-                    # 刷新下拉列表
                     display_names = [os.path.splitext(name)[0] for name in app.bill_files]
                     self.bill_spinner.values = display_names
                     if app.current_bill:
@@ -340,23 +545,21 @@ class MainScreen(Screen):
     def go_to_record(self, instance):
         self.manager.current = 'record'
 
-    def on_import(self, instance):
+    def go_to_import(self, instance):
         self.manager.current = 'import'
 
-    def on_export(self, instance):
+    def go_to_export(self, instance):
         self.manager.current = 'export'
 
     def exit_application(self, instance):
         App.get_running_app().stop()
 
-# ---------- 记收支页面（使用SQLite）----------
+# ---------- 记收支页面 ----------
 class RecordScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # 主布局：垂直方向
         main_layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(8))
 
-        # 1. 标题
         title = Label(
             text='记录收支',
             size_hint_y=0.08,
@@ -365,47 +568,14 @@ class RecordScreen(Screen):
         )
         main_layout.add_widget(title)
 
-        # 2. 交易日期选择
+        # 日期选择（使用简化的自定义控件）
         date_layout = BoxLayout(size_hint_y=0.1, spacing=dp(5))
         date_layout.add_widget(Label(text='交易日期：', size_hint_x=0.2))
-
-        date_sub_layout = BoxLayout(size_hint_x=0.8, spacing=dp(3))
-
-        now = datetime.datetime.now()
-        current_year = now.year if START_YEAR <= now.year <= END_YEAR else START_YEAR
-        current_month = now.month
-        current_day = now.day
-
-        self.year_spinner = Spinner(
-            text=str(current_year),
-            values=YEAR_LIST,
-            size_hint_x=0.33,
-            font_size=dp(12)
-        )
-        date_sub_layout.add_widget(self.year_spinner)
-
-        months = [f"{m:02d}" for m in range(1, 13)]
-        self.month_spinner = Spinner(
-            text=f"{current_month:02d}",
-            values=months,
-            size_hint_x=0.33,
-            font_size=dp(12)
-        )
-        date_sub_layout.add_widget(self.month_spinner)
-
-        days = [f"{d:02d}" for d in range(1, 32)]
-        self.day_spinner = Spinner(
-            text=f"{current_day:02d}",
-            values=days,
-            size_hint_x=0.33,
-            font_size=dp(12)
-        )
-        date_sub_layout.add_widget(self.day_spinner)
-
-        date_layout.add_widget(date_sub_layout)
+        self.date_selector = DateSelector(query_type='天')
+        date_layout.add_widget(self.date_selector)
         main_layout.add_widget(date_layout)
 
-        # 3. 收支类型选择
+        # 收支类型
         type_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         type_layout.add_widget(Label(text='收支类型：', size_hint_x=0.2))
         self.type_spinner = Spinner(
@@ -417,7 +587,7 @@ class RecordScreen(Screen):
         type_layout.add_widget(self.type_spinner)
         main_layout.add_widget(type_layout)
 
-        # 4. 金额输入
+        # 金额
         amount_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         amount_layout.add_widget(Label(text='金额（元）：', size_hint_x=0.2))
         self.amount_input = TextInput(
@@ -429,7 +599,7 @@ class RecordScreen(Screen):
         amount_layout.add_widget(self.amount_input)
         main_layout.add_widget(amount_layout)
 
-        # 5. 事件（因由）输入
+        # 事件
         event_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         event_layout.add_widget(Label(text='因由：', size_hint_x=0.2))
         self.event_input = TextInput(
@@ -440,7 +610,7 @@ class RecordScreen(Screen):
         event_layout.add_widget(self.event_input)
         main_layout.add_widget(event_layout)
 
-        # 6. 相关方输入
+        # 相关方
         party_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         party_layout.add_widget(Label(text='相关方：', size_hint_x=0.2))
         self.party_input = TextInput(
@@ -451,7 +621,7 @@ class RecordScreen(Screen):
         party_layout.add_widget(self.party_input)
         main_layout.add_widget(party_layout)
 
-        # 7. 交易平台输入
+        # 交易平台
         platform_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         platform_layout.add_widget(Label(text='交易平台：', size_hint_x=0.2))
         self.platform_input = TextInput(
@@ -462,7 +632,7 @@ class RecordScreen(Screen):
         platform_layout.add_widget(self.platform_input)
         main_layout.add_widget(platform_layout)
 
-        # 8. 其他信息输入
+        # 其他
         other_layout = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         other_layout.add_widget(Label(text='其他：', size_hint_x=0.2))
         self.other_input = TextInput(
@@ -473,15 +643,14 @@ class RecordScreen(Screen):
         other_layout.add_widget(self.other_input)
         main_layout.add_widget(other_layout)
 
-        # 9. 占位布局 (可以适当调整高度)
-        placeholder = BoxLayout(size_hint_y=0.1)
-        main_layout.add_widget(placeholder)
+        # 占位
+        main_layout.add_widget(BoxLayout(size_hint_y=0.1))
 
-        # 10. 保存按钮和保存并退出按钮放在一行
+        # 按钮行
         btn_row = BoxLayout(size_hint_y=0.09, spacing=dp(5))
         save_only_btn = Button(
             text='保存',
-            background_color=(0.2, 0.7, 0.2, 1),
+            background_color=COLOR_GREEN,
             font_size=dp(14)
         )
         save_only_btn.bind(on_press=self.save_only)
@@ -489,88 +658,32 @@ class RecordScreen(Screen):
 
         save_and_exit_btn = Button(
             text='保存并退出',
-            background_color=(0.2, 0.7, 0.2, 1),
+            background_color=COLOR_GREEN,
             font_size=dp(14)
         )
         save_and_exit_btn.bind(on_press=self.save_and_exit)
         btn_row.add_widget(save_and_exit_btn)
-
         main_layout.add_widget(btn_row)
 
-        # 11. 返回主界面按钮
         back_btn = Button(
             text='返回主界面',
-            background_color=(0.7, 0.7, 0.7, 1),
+            background_color=COLOR_GRAY,
             size_hint_y=0.09,
             font_size=dp(14)
         )
-        back_btn.bind(on_press=self.go_back_to_main)
+        back_btn.bind(on_press=self.go_back)
         main_layout.add_widget(back_btn)
 
-        # 12. 提示标签
         self.tip_label = Label(
             text='',
             size_hint_y=0.05,
             halign='center',
-            color=(1, 0, 0, 1),
+            color=COLOR_RED,
             font_size=dp(12)
         )
         main_layout.add_widget(self.tip_label)
 
         self.add_widget(main_layout)
-
-    def save_and_exit(self, instance):
-        """保存收支数据到当前账单的SQLite数据库并返回主界面"""
-        amount_text = self.amount_input.text.strip()
-        if not amount_text:
-            self.tip_label.text = '请输入金额！'
-            return
-        try:
-            amount = float(amount_text)
-            if amount <= 0:
-                self.tip_label.text = '金额必须大于0！'
-                return
-        except ValueError:
-            self.tip_label.text = '金额格式错误！'
-            return
-
-        try:
-            year = self.year_spinner.text
-            month = self.month_spinner.text
-            day = self.day_spinner.text
-            datetime.datetime(int(year), int(month), int(day))
-            date_str = f"{year}-{month}-{day}"
-        except ValueError as e:
-            self.tip_label.text = f'无效日期：{e}'
-            return
-
-        trade_type = self.type_spinner.text
-        event = self.event_input.text.strip() or ''
-        party = self.party_input.text.strip() or ''
-        platform = self.platform_input.text.strip() or ''
-        other = self.other_input.text.strip() or ''
-
-        app = App.get_running_app()
-        db_path = app.get_current_db_path()
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        try:
-            c.execute('''
-                INSERT INTO records (date, type, amount, event, party, platform, other)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (date_str, trade_type, amount, event, party, platform, other))
-            conn.commit()
-            self.tip_label.text = ''
-            self.amount_input.text = ''
-            self.event_input.text = ''
-            self.party_input.text = ''
-            self.platform_input.text = ''
-            self.other_input.text = ''
-            self.manager.current = 'main'
-        except Exception as e:
-            self.tip_label.text = f'保存失败：{str(e)}'
-        finally:
-            conn.close()
 
     def _save_record(self):
         """保存记录到数据库，返回 (成功标志, 错误信息或None)"""
@@ -585,12 +698,9 @@ class RecordScreen(Screen):
             return False, '金额格式错误！'
 
         try:
-            year = self.year_spinner.text
-            month = self.month_spinner.text
-            day = self.day_spinner.text
-            datetime.datetime(int(year), int(month), int(day))
-            date_str = f"{year}-{month}-{day}"
-        except ValueError as e:
+            start_date, _ = self.date_selector.get_date_range()  # 仅需 start_date
+            date_str = start_date
+        except Exception as e:
             return False, f'无效日期：{e}'
 
         trade_type = self.type_spinner.text
@@ -609,7 +719,6 @@ class RecordScreen(Screen):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (date_str, trade_type, amount, event, party, platform, other))
             conn.commit()
-            # 清空输入字段（保留日期和类型选择不变）
             self.amount_input.text = ''
             self.event_input.text = ''
             self.party_input.text = ''
@@ -617,36 +726,34 @@ class RecordScreen(Screen):
             self.other_input.text = ''
             return True, None
         except Exception as e:
+            logging.exception("记录保存失败")
             return False, f'保存失败：{str(e)}'
         finally:
             conn.close()
 
     def save_only(self, instance):
-        """保存记录但不退出"""
         success, msg = self._save_record()
         if success:
             self.tip_label.text = '保存成功'
             self.tip_label.color = (0, 0.7, 0, 1)
         else:
             self.tip_label.text = msg
-            self.tip_label.color = (1, 0, 0, 1)
+            self.tip_label.color = COLOR_RED
 
     def save_and_exit(self, instance):
-        """保存记录并返回主界面"""
         success, msg = self._save_record()
         if success:
             self.tip_label.text = ''
             self.manager.current = 'main'
         else:
             self.tip_label.text = msg
-            self.tip_label.color = (1, 0, 0, 1)
+            self.tip_label.color = COLOR_RED
 
-    def go_back_to_main(self, instance):
+    def go_back(self, instance):
         self.tip_label.text = ''
         self.manager.current = 'main'
 
-
-# ---------- 查看事件界面（使用SQLite）----------
+# ---------- 查看事件界面 ----------
 class ViewEventScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -656,7 +763,7 @@ class ViewEventScreen(Screen):
             text='返回主界面',
             size_hint_y=None,
             height=dp(35),
-            background_color=(0.8, 0.8, 0.8, 1)
+            background_color=COLOR_GRAY
         )
         back_btn.bind(on_press=self.go_back)
         main_layout.add_widget(back_btn)
@@ -670,8 +777,8 @@ class ViewEventScreen(Screen):
         self.type_spinner.bind(text=self.on_type_change)
         main_layout.add_widget(self.type_spinner)
 
-        self.date_container = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2))
-        main_layout.add_widget(self.date_container)
+        self.date_selector = DateSelector(query_type='天')
+        main_layout.add_widget(self.date_selector)
 
         self.income_type_spinner = Spinner(
             text='全部',
@@ -685,7 +792,7 @@ class ViewEventScreen(Screen):
             text='查询',
             size_hint_y=None,
             height=dp(35),
-            background_color=(0.3, 0.6, 0.9, 1)
+            background_color=COLOR_BLUE
         )
         query_btn.bind(on_press=self.query_events)
         main_layout.add_widget(query_btn)
@@ -715,141 +822,20 @@ class ViewEventScreen(Screen):
 
         self.add_widget(main_layout)
 
-        self.date_spinners = {}
-        self.update_date_controls('天')
+    def on_type_change(self, instance, text):
+        self.date_selector.set_type(text)
 
     def go_back(self, instance):
         self.manager.current = 'main'
-
-    def on_type_change(self, instance, text):
-        self.update_date_controls(text)
-
-    def update_date_controls(self, query_type):
-        self.date_container.clear_widgets()
-        self.date_spinners.clear()
-
-        now = datetime.datetime.now()
-        current_year = now.year if START_YEAR <= now.year <= END_YEAR else START_YEAR
-        current_month = now.month
-        current_day = now.day
-
-        spinner_style = {
-            'size_hint_y': None,
-            'height': dp(30),
-            'font_size': dp(12)
-        }
-
-        if query_type == '天':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(month_sp)
-            self.date_spinners['month'] = month_sp
-
-            days = [f"{d:02d}" for d in range(1, 32)]
-            day_sp = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(day_sp)
-            self.date_spinners['day'] = day_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '月':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.5, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.5, **spinner_style)
-            h_layout.add_widget(month_sp)
-            self.date_spinners['month'] = month_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '年':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=1, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '时间段':
-            start_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
-            start_layout.add_widget(Label(text='从', size_hint_x=0.08, font_size=dp(12), halign='center'))
-            start_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_year)
-            self.date_spinners['start_year'] = start_year
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            start_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_month)
-            self.date_spinners['start_month'] = start_month
-
-            days = [f"{d:02d}" for d in range(1, 32)]
-            start_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_day)
-            self.date_spinners['start_day'] = start_day
-
-            self.date_container.add_widget(start_layout)
-
-            end_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
-            end_layout.add_widget(Label(text='到', size_hint_x=0.08, font_size=dp(12), halign='center'))
-            end_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_year)
-            self.date_spinners['end_year'] = end_year
-
-            end_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_month)
-            self.date_spinners['end_month'] = end_month
-
-            end_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_day)
-            self.date_spinners['end_day'] = end_day
-
-            self.date_container.add_widget(end_layout)
 
     def query_events(self, instance):
         query_type = self.type_spinner.text
         income_filter = self.income_type_spinner.text
 
         try:
-            if query_type == '天':
-                year = self.date_spinners['year'].text
-                month = self.date_spinners['month'].text
-                day = self.date_spinners['day'].text
-                start_date = f"{year}-{month}-{day}"
-                end_date = start_date
-            elif query_type == '月':
-                year = self.date_spinners['year'].text
-                month = self.date_spinners['month'].text
-                start_date = f"{year}-{month}-01"
-                if month == '12':
-                    end_date = f"{int(year)+1}-01-01"
-                else:
-                    end_date = f"{year}-{int(month)+1:02d}-01"
-            elif query_type == '年':
-                year = self.date_spinners['year'].text
-                start_date = f"{year}-01-01"
-                end_date = f"{int(year)+1}-01-01"
-            elif query_type == '时间段':
-                start_year = self.date_spinners['start_year'].text
-                start_month = self.date_spinners['start_month'].text
-                start_day = self.date_spinners['start_day'].text
-                end_year = self.date_spinners['end_year'].text
-                end_month = self.date_spinners['end_month'].text
-                end_day = self.date_spinners['end_day'].text
-                start_date = f"{start_year}-{start_month}-{start_day}"
-                end_date = f"{end_year}-{end_month}-{end_day}"
-            else:
-                self.result_label.text = "未知查询类型"
-                return
-        except KeyError as e:
-            self.result_label.text = f"日期控件未初始化：{e}"
+            start_date, end_date = self.date_selector.get_date_range()
+        except Exception as e:
+            self.result_label.text = f"日期错误：{e}"
             return
 
         app = App.get_running_app()
@@ -919,12 +905,12 @@ class ViewEventScreen(Screen):
             self.result_label.text = "\n".join(lines)
 
         except Exception as e:
+            logging.exception("查询失败")
             self.result_label.text = f"查询出错：{str(e)}"
         finally:
             conn.close()
 
-
-# ---------- 导入页面（从Excel导入到SQLite）----------
+# ---------- 导入页面 ----------
 class ImportScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -951,7 +937,7 @@ class ImportScreen(Screen):
         # 选择外部文件
         file_layout = BoxLayout(size_hint_y=0.08, spacing=dp(5))
         file_layout.add_widget(Label(text='外部文件：', size_hint_x=0.25, font_size=dp(14)))
-        self.file_path_label = Label(text='未选择', size_hint_x=0.5, font_size=dp(12), color=(0.5,0.5,0.5,1))
+        self.file_path_label = Label(text='未选择', size_hint_x=0.5, font_size=dp(12), color=COLOR_DARK_GRAY)
         file_layout.add_widget(self.file_path_label)
         choose_file_btn = Button(text='浏览', size_hint_x=0.25, font_size=dp(12))
         choose_file_btn.bind(on_press=self.choose_file)
@@ -988,28 +974,26 @@ class ImportScreen(Screen):
         import_btn = Button(
             text='执行导入',
             size_hint_y=0.08,
-            background_color=(0.2, 0.7, 0.2, 1),
+            background_color=COLOR_GREEN,
             font_size=dp(14)
         )
         import_btn.bind(on_press=self.do_import)
         main_layout.add_widget(import_btn)
 
-        # 返回按钮
         back_btn = Button(
             text='返回主界面',
             size_hint_y=0.08,
-            background_color=(0.7, 0.7, 0.7, 1),
+            background_color=COLOR_GRAY,
             font_size=dp(14)
         )
         back_btn.bind(on_press=self.go_back)
         main_layout.add_widget(back_btn)
 
-        # 提示标签
         self.tip_label = Label(
             text='',
             size_hint_y=0.05,
             halign='center',
-            color=(1,0,0,1),
+            color=COLOR_RED,
             font_size=dp(12)
         )
         main_layout.add_widget(self.tip_label)
@@ -1025,6 +1009,7 @@ class ImportScreen(Screen):
             self.target_spinner.text = os.path.splitext(app.current_bill)[0]
 
     def on_mode_change(self, instance, mode):
+        # 通过 opacity 和 disabled 增强反馈
         if mode == '导入成为新账单':
             self.target_layout.disabled = True
             self.target_layout.opacity = 0.3
@@ -1042,10 +1027,35 @@ class ImportScreen(Screen):
             self.new_name_layout.opacity = 0.3
 
     def choose_file(self, instance):
-        filechooser.open_file(
-            on_selection=self.on_file_selected,
-            filters=["*.xlsx"]
-        )
+        try:
+            filechooser.open_file(on_selection=self.on_file_selected, filters=["*.xlsx"])
+        except Exception as e:
+            # 如果 filechooser 不可用，提示手动输入路径
+            self.show_manual_path_popup()
+
+    def show_manual_path_popup(self):
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(Label(text='文件选择器不可用，请手动输入Excel文件路径：'))
+        path_input = TextInput(hint_text='例如：C:\\myfile.xlsx', multiline=False)
+        content.add_widget(path_input)
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
+        cancel_btn = Button(text='取消')
+        ok_btn = Button(text='确定', background_color=COLOR_GREEN)
+        btn_layout.add_widget(cancel_btn)
+        btn_layout.add_widget(ok_btn)
+        content.add_widget(btn_layout)
+        popup = Popup(title='手动输入路径', content=content, size_hint=(0.9, 0.4))
+        def on_ok(btn):
+            path = path_input.text.strip()
+            if path and os.path.exists(path):
+                self.on_file_selected([path])
+                popup.dismiss()
+            else:
+                path_input.text = ''
+                path_input.hint_text = '文件不存在，请重新输入'
+        ok_btn.bind(on_press=on_ok)
+        cancel_btn.bind(on_press=popup.dismiss)
+        popup.open()
 
     def on_file_selected(self, selection):
         if selection:
@@ -1055,17 +1065,17 @@ class ImportScreen(Screen):
         else:
             self.selected_file = None
             self.file_path_label.text = '未选择'
-            self.file_path_label.color = (0.5,0.5,0.5,1)
+            self.file_path_label.color = COLOR_DARK_GRAY
 
     def _read_excel_to_records(self, filepath):
-        """读取Excel文件，返回记录列表（每个记录为字典），并验证必要列"""
+        """读取Excel文件，返回记录列表，并验证必要列，日期规范化"""
         wb = load_workbook(filepath, data_only=True)
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
             return []
         headers = rows[0]
-        # 期望的列名映射（允许大小写和空格差异）
+        # 期望的列名映射
         expected = ['时间', '收支', '金额', '事件', '相关方', '交易平台', '其他']
         col_indices = {}
         for i, h in enumerate(headers):
@@ -1075,7 +1085,6 @@ class ImportScreen(Screen):
                     if h_norm == exp:
                         col_indices[exp] = i
                         break
-        # 确保必要列存在
         required = ['时间', '收支', '金额']
         for r in required:
             if r not in col_indices:
@@ -1083,27 +1092,27 @@ class ImportScreen(Screen):
 
         records = []
         for row in rows[1:]:
-            if not any(row):  # 跳过全空行
+            if not any(row):
                 continue
+            # 日期解析
             date_cell = row[col_indices['时间']] if col_indices['时间'] < len(row) else None
-            if isinstance(date_cell, datetime.datetime):
-                date_str = date_cell.strftime('%Y-%m-%d')
-            else:
-                date_str = str(date_cell).strip() if date_cell else ''
+            date_str = parse_date_cell(date_cell)
             if not date_str:
-                continue  # 无日期则跳过
+                continue  # 无效日期则跳过该行
+
             type_cell = row[col_indices['收支']] if col_indices['收支'] < len(row) else ''
             type_str = str(type_cell).strip() if type_cell else ''
             if type_str not in ('收入', '支出'):
-                continue  # 跳过无效类型
+                continue
 
             amount_cell = row[col_indices['金额']] if col_indices['金额'] < len(row) else 0
             try:
                 amount = float(amount_cell) if amount_cell not in (None, '') else 0.0
+                if amount <= 0:
+                    continue  # 金额必须为正
             except:
-                amount = 0.0
+                continue
 
-            # 其他字段
             def get_val(idx):
                 if idx < len(row):
                     val = row[idx]
@@ -1125,6 +1134,22 @@ class ImportScreen(Screen):
             })
         return records
 
+    def _insert_records_with_transaction(self, conn, records):
+        """在事务中插入多条记录"""
+        c = conn.cursor()
+        c.execute("BEGIN")
+        try:
+            for rec in records:
+                c.execute('''
+                    INSERT INTO records (date, type, amount, event, party, platform, other)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (rec['date'], rec['type'], rec['amount'], rec['event'],
+                      rec['party'], rec['platform'], rec['other']))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+
     def do_import(self, instance):
         mode = self.mode_spinner.text
         app = App.get_running_app()
@@ -1136,6 +1161,7 @@ class ImportScreen(Screen):
         try:
             records = self._read_excel_to_records(self.selected_file)
         except Exception as e:
+            logging.exception("读取Excel失败")
             self.tip_label.text = f'读取外部文件失败：{str(e)}'
             return
 
@@ -1145,41 +1171,34 @@ class ImportScreen(Screen):
 
         try:
             if mode == '导入成为新账单':
-                new_name = self.new_name_input.text.strip()
-                if not new_name:
+                raw_name = self.new_name_input.text.strip()
+                if not raw_name:
                     self.tip_label.text = '请输入新账单名称'
                     return
-                # 创建新数据库文件
-                filename = new_name + '.db'
+                safe_name = sanitize_filename(raw_name)
+                filename = safe_name + '.db'
                 filepath = os.path.join(app.bills_dir, filename)
                 if os.path.exists(filepath):
                     self.tip_label.text = '该账单名称已存在，请换一个'
                     return
-                # 初始化数据库并插入数据
                 init_database(filepath)
                 conn = sqlite3.connect(filepath)
-                c = conn.cursor()
-                for rec in records:
-                    c.execute('''
-                        INSERT INTO records (date, type, amount, event, party, platform, other)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (rec['date'], rec['type'], rec['amount'], rec['event'],
-                          rec['party'], rec['platform'], rec['other']))
-                conn.commit()
+                self._insert_records_with_transaction(conn, records)
                 conn.close()
                 app.refresh_bill_list()
                 app.current_bill = filename
-                self.tip_label.text = f'导入成功，已切换到新账单“{new_name}”'
+                self.tip_label.text = f'导入成功，已切换到新账单“{safe_name}”'
 
             elif mode == '与指定账单合并为新账单':
                 target_display = self.target_spinner.text
                 if not target_display:
                     self.tip_label.text = '请选择目标账单'
                     return
-                new_name = self.new_name_input.text.strip()
-                if not new_name:
+                raw_new = self.new_name_input.text.strip()
+                if not raw_new:
                     self.tip_label.text = '请输入新账单名称'
                     return
+                safe_new = sanitize_filename(raw_new)
                 target_file = None
                 for f in app.bill_files:
                     if os.path.splitext(f)[0] == target_display:
@@ -1189,7 +1208,7 @@ class ImportScreen(Screen):
                     self.tip_label.text = '目标账单不存在'
                     return
 
-                # 读取目标数据库的所有记录
+                # 读取目标数据库所有记录
                 target_path = os.path.join(app.bills_dir, target_file)
                 conn_src = sqlite3.connect(target_path)
                 c_src = conn_src.cursor()
@@ -1198,33 +1217,37 @@ class ImportScreen(Screen):
                 conn_src.close()
 
                 # 创建新数据库
-                new_filename = new_name + '.db'
+                new_filename = safe_new + '.db'
                 new_path = os.path.join(app.bills_dir, new_filename)
                 if os.path.exists(new_path):
                     self.tip_label.text = '该账单名称已存在，请换一个'
                     return
                 init_database(new_path)
                 conn_new = sqlite3.connect(new_path)
-                c_new = conn_new.cursor()
-
-                # 插入源数据
-                for row in src_rows:
-                    c_new.execute('''
-                        INSERT INTO records (date, type, amount, event, party, platform, other)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', row)
-                # 插入导入数据
-                for rec in records:
-                    c_new.execute('''
-                        INSERT INTO records (date, type, amount, event, party, platform, other)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (rec['date'], rec['type'], rec['amount'], rec['event'],
-                          rec['party'], rec['platform'], rec['other']))
-                conn_new.commit()
-                conn_new.close()
+                # 开启事务
+                conn_new.execute("BEGIN")
+                try:
+                    c_new = conn_new.cursor()
+                    for row in src_rows:
+                        c_new.execute('''
+                            INSERT INTO records (date, type, amount, event, party, platform, other)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', row)
+                    for rec in records:
+                        c_new.execute('''
+                            INSERT INTO records (date, type, amount, event, party, platform, other)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (rec['date'], rec['type'], rec['amount'], rec['event'],
+                              rec['party'], rec['platform'], rec['other']))
+                    conn_new.commit()
+                except Exception as e:
+                    conn_new.rollback()
+                    raise e
+                finally:
+                    conn_new.close()
                 app.refresh_bill_list()
                 app.current_bill = new_filename
-                self.tip_label.text = f'合并成功，已切换到新账单“{new_name}”'
+                self.tip_label.text = f'合并成功，已切换到新账单“{safe_new}”'
 
             elif mode == '并入指定账单':
                 target_display = self.target_spinner.text
@@ -1242,32 +1265,25 @@ class ImportScreen(Screen):
 
                 target_path = os.path.join(app.bills_dir, target_file)
                 conn = sqlite3.connect(target_path)
-                c = conn.cursor()
-                for rec in records:
-                    c.execute('''
-                        INSERT INTO records (date, type, amount, event, party, platform, other)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (rec['date'], rec['type'], rec['amount'], rec['event'],
-                          rec['party'], rec['platform'], rec['other']))
-                conn.commit()
+                self._insert_records_with_transaction(conn, records)
                 conn.close()
                 self.tip_label.text = f'并入成功，账单“{target_display}”已更新'
 
             # 清空选择
             self.selected_file = None
             self.file_path_label.text = '未选择'
-            self.file_path_label.color = (0.5,0.5,0.5,1)
-            self.tip_label.color = (0,0.7,0,1)
+            self.file_path_label.color = COLOR_DARK_GRAY
+            self.tip_label.color = (0, 0.7, 0, 1)
 
         except Exception as e:
+            logging.exception("导入失败")
             self.tip_label.text = f'导入失败：{str(e)}'
-            self.tip_label.color = (1,0,0,1)
+            self.tip_label.color = COLOR_RED
 
     def go_back(self, instance):
         self.manager.current = 'main'
 
-
-# ---------- 导出页面（从SQLite导出到Excel）----------
+# ---------- 导出页面 ----------
 class ExportScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1289,9 +1305,8 @@ class ExportScreen(Screen):
         type_layout.add_widget(self.type_spinner)
         main_layout.add_widget(type_layout)
 
-        # 动态日期容器
-        self.date_container = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2))
-        main_layout.add_widget(self.date_container)
+        self.date_selector = DateSelector(query_type='天')
+        main_layout.add_widget(self.date_selector)
 
         # 收支类型选择
         income_layout = BoxLayout(size_hint_y=0.08, spacing=dp(5))
@@ -1305,6 +1320,18 @@ class ExportScreen(Screen):
         income_layout.add_widget(self.income_spinner)
         main_layout.add_widget(income_layout)
 
+        # 导出格式选择（新增）
+        format_layout = BoxLayout(size_hint_y=0.08, spacing=dp(5))
+        format_layout.add_widget(Label(text='导出格式：', size_hint_x=0.25, font_size=dp(14)))
+        self.format_spinner = Spinner(
+            text='Excel (.xlsx)',
+            values=('Excel (.xlsx)', 'CSV (.csv)'),
+            size_hint_x=0.75,
+            font_size=dp(12)
+        )
+        format_layout.add_widget(self.format_spinner)
+        main_layout.add_widget(format_layout)
+
         # 目标文件夹选择
         folder_layout = BoxLayout(size_hint_y=0.08, spacing=dp(5))
         folder_layout.add_widget(Label(text='目标文件夹：', size_hint_x=0.25, font_size=dp(14)))
@@ -1312,7 +1339,7 @@ class ExportScreen(Screen):
             text='未选择',
             size_hint_x=0.5,
             font_size=dp(12),
-            color=(0.5, 0.5, 0.5, 1),
+            color=COLOR_DARK_GRAY,
             shorten=True,
             shorten_from='right'
         )
@@ -1341,36 +1368,32 @@ class ExportScreen(Screen):
         export_btn = Button(
             text='执行导出',
             size_hint_y=0.1,
-            background_color=(0.2, 0.7, 0.2, 1),
+            background_color=COLOR_GREEN,
             font_size=dp(16)
         )
         export_btn.bind(on_press=self.do_export)
         main_layout.add_widget(export_btn)
 
-        # 返回主界面按钮
         back_btn = Button(
             text='返回主界面',
             size_hint_y=0.08,
-            background_color=(0.7, 0.7, 0.7, 1),
+            background_color=COLOR_GRAY,
             font_size=dp(14)
         )
         back_btn.bind(on_press=self.go_back)
         main_layout.add_widget(back_btn)
 
-        # 提示标签
         self.tip_label = Label(
             text='',
             size_hint_y=0.05,
             halign='center',
-            color=(1,0,0,1),
+            color=COLOR_RED,
             font_size=dp(12)
         )
         main_layout.add_widget(self.tip_label)
 
         self.add_widget(main_layout)
 
-        self.date_spinners = {}
-        self.update_date_controls('天')
         self.selected_folder = None
 
     def on_enter(self):
@@ -1382,99 +1405,37 @@ class ExportScreen(Screen):
             self.filename_input.text = ''
 
     def on_type_change(self, instance, text):
-        self.update_date_controls(text)
-
-    def update_date_controls(self, query_type):
-        self.date_container.clear_widgets()
-        self.date_spinners.clear()
-
-        now = datetime.datetime.now()
-        current_year = now.year if START_YEAR <= now.year <= END_YEAR else START_YEAR
-        current_month = now.month
-        current_day = now.day
-
-        spinner_style = {
-            'size_hint_y': None,
-            'height': dp(30),
-            'font_size': dp(12)
-        }
-
-        if query_type == '天':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(month_sp)
-            self.date_spinners['month'] = month_sp
-
-            days = [f"{d:02d}" for d in range(1, 32)]
-            day_sp = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.33, **spinner_style)
-            h_layout.add_widget(day_sp)
-            self.date_spinners['day'] = day_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '月':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(3))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.5, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            month_sp = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.5, **spinner_style)
-            h_layout.add_widget(month_sp)
-            self.date_spinners['month'] = month_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '年':
-            h_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30))
-            year_sp = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=1, **spinner_style)
-            h_layout.add_widget(year_sp)
-            self.date_spinners['year'] = year_sp
-
-            self.date_container.add_widget(h_layout)
-
-        elif query_type == '时间段':
-            start_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
-            start_layout.add_widget(Label(text='从', size_hint_x=0.08, font_size=dp(12), halign='center'))
-            start_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_year)
-            self.date_spinners['start_year'] = start_year
-
-            months = [f"{m:02d}" for m in range(1, 13)]
-            start_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_month)
-            self.date_spinners['start_month'] = start_month
-
-            days = [f"{d:02d}" for d in range(1, 32)]
-            start_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
-            start_layout.add_widget(start_day)
-            self.date_spinners['start_day'] = start_day
-
-            self.date_container.add_widget(start_layout)
-
-            end_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(30), spacing=dp(2))
-            end_layout.add_widget(Label(text='到', size_hint_x=0.08, font_size=dp(12), halign='center'))
-            end_year = Spinner(text=str(current_year), values=YEAR_LIST, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_year)
-            self.date_spinners['end_year'] = end_year
-
-            end_month = Spinner(text=f"{current_month:02d}", values=months, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_month)
-            self.date_spinners['end_month'] = end_month
-
-            end_day = Spinner(text=f"{current_day:02d}", values=days, size_hint_x=0.28, **spinner_style)
-            end_layout.add_widget(end_day)
-            self.date_spinners['end_day'] = end_day
-
-            self.date_container.add_widget(end_layout)
+        self.date_selector.set_type(text)
 
     def choose_folder(self, instance):
-        filechooser.choose_dir(on_selection=self.on_folder_selected)
+        try:
+            filechooser.choose_dir(on_selection=self.on_folder_selected)
+        except Exception as e:
+            self.show_manual_folder_popup()
+
+    def show_manual_folder_popup(self):
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(Label(text='文件夹选择器不可用，请手动输入目标文件夹路径：'))
+        path_input = TextInput(hint_text='例如：C:\\myfolder', multiline=False)
+        content.add_widget(path_input)
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
+        cancel_btn = Button(text='取消')
+        ok_btn = Button(text='确定', background_color=COLOR_GREEN)
+        btn_layout.add_widget(cancel_btn)
+        btn_layout.add_widget(ok_btn)
+        content.add_widget(btn_layout)
+        popup = Popup(title='手动输入路径', content=content, size_hint=(0.9, 0.4))
+        def on_ok(btn):
+            path = path_input.text.strip()
+            if path and os.path.isdir(path):
+                self.on_folder_selected([path])
+                popup.dismiss()
+            else:
+                path_input.text = ''
+                path_input.hint_text = '文件夹不存在，请重新输入'
+        ok_btn.bind(on_press=on_ok)
+        cancel_btn.bind(on_press=popup.dismiss)
+        popup.open()
 
     def on_folder_selected(self, selection):
         if selection:
@@ -1484,60 +1445,62 @@ class ExportScreen(Screen):
         else:
             self.selected_folder = None
             self.folder_label.text = '未选择'
-            self.folder_label.color = (0.5, 0.5, 0.5, 1)
+            self.folder_label.color = COLOR_DARK_GRAY
 
     def do_export(self, instance):
         if not self.selected_folder:
             self.tip_label.text = '请先选择目标文件夹'
-            self.tip_label.color = (1, 0, 0, 1)
+            self.tip_label.color = COLOR_RED
             return
 
-        filename = self.filename_input.text.strip()
-        if not filename:
+        raw_filename = self.filename_input.text.strip()
+        if not raw_filename:
             self.tip_label.text = '请输入文件名'
-            self.tip_label.color = (1, 0, 0, 1)
+            self.tip_label.color = COLOR_RED
             return
-        if not filename.lower().endswith('.xlsx'):
-            filename += '.xlsx'
 
-        full_path = os.path.join(self.selected_folder, filename)
+        safe_filename = sanitize_filename(raw_filename)
+        export_format = self.format_spinner.text
+        if export_format == 'Excel (.xlsx)':
+            if not safe_filename.lower().endswith('.xlsx'):
+                safe_filename += '.xlsx'
+        else:  # CSV
+            if not safe_filename.lower().endswith('.csv'):
+                safe_filename += '.csv'
 
+        full_path = os.path.join(self.selected_folder, safe_filename)
+
+        # 检查文件是否已存在
+        if os.path.exists(full_path):
+            # 弹出确认覆盖对话框
+            content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+            content.add_widget(Label(text=f'文件“{safe_filename}”已存在，是否覆盖？'))
+            btn_layout = BoxLayout(size_hint_y=0.3, spacing=dp(10))
+            cancel_btn = Button(text='取消')
+            ok_btn = Button(text='覆盖', background_color=COLOR_RED)
+            btn_layout.add_widget(cancel_btn)
+            btn_layout.add_widget(ok_btn)
+            content.add_widget(btn_layout)
+            popup = Popup(title='确认覆盖', content=content, size_hint=(0.8, 0.3))
+
+            def on_ok(btn):
+                popup.dismiss()
+                self._perform_export(full_path, export_format)
+            ok_btn.bind(on_press=on_ok)
+            cancel_btn.bind(on_press=popup.dismiss)
+            popup.open()
+        else:
+            self._perform_export(full_path, export_format)
+
+    def _perform_export(self, full_path, export_format):
+        """实际执行导出（文件已确保可写入）"""
         query_type = self.type_spinner.text
         income_filter = self.income_spinner.text
 
         try:
-            if query_type == '天':
-                year = self.date_spinners['year'].text
-                month = self.date_spinners['month'].text
-                day = self.date_spinners['day'].text
-                start_date = f"{year}-{month}-{day}"
-                end_date = start_date
-            elif query_type == '月':
-                year = self.date_spinners['year'].text
-                month = self.date_spinners['month'].text
-                start_date = f"{year}-{month}-01"
-                if month == '12':
-                    end_date = f"{int(year)+1}-01-01"
-                else:
-                    end_date = f"{year}-{int(month)+1:02d}-01"
-            elif query_type == '年':
-                year = self.date_spinners['year'].text
-                start_date = f"{year}-01-01"
-                end_date = f"{int(year)+1}-01-01"
-            elif query_type == '时间段':
-                start_year = self.date_spinners['start_year'].text
-                start_month = self.date_spinners['start_month'].text
-                start_day = self.date_spinners['start_day'].text
-                end_year = self.date_spinners['end_year'].text
-                end_month = self.date_spinners['end_month'].text
-                end_day = self.date_spinners['end_day'].text
-                start_date = f"{start_year}-{start_month}-{start_day}"
-                end_date = f"{end_year}-{end_month}-{end_day}"
-            else:
-                self.tip_label.text = "未知查询类型"
-                return
-        except KeyError as e:
-            self.tip_label.text = f"日期控件未初始化：{e}"
+            start_date, end_date = self.date_selector.get_date_range()
+        except Exception as e:
+            self.tip_label.text = f"日期错误：{e}"
             return
 
         app = App.get_running_app()
@@ -1577,29 +1540,34 @@ class ExportScreen(Screen):
                 self.tip_label.text = "没有符合条件的记录，无法导出"
                 return
 
-            # 写入Excel
-            wb = Workbook()
-            ws = wb.active
-            ws.title = '导出结果'
-            headers = ['时间', '收支', '金额', '事件', '相关方', '交易平台', '其他']
-            ws.append(headers)
+            if export_format == 'Excel (.xlsx)':
+                wb = Workbook()
+                ws = wb.active
+                ws.title = '导出结果'
+                headers = ['时间', '收支', '金额', '事件', '相关方', '交易平台', '其他']
+                ws.append(headers)
+                for row in rows:
+                    ws.append(row)
+                wb.save(full_path)
+            else:  # CSV
+                import csv
+                with open(full_path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['时间', '收支', '金额', '事件', '相关方', '交易平台', '其他'])
+                    writer.writerows(rows)
 
-            for row in rows:
-                # row 顺序与 SELECT 一致
-                ws.append(row)
-
-            wb.save(full_path)
             self.tip_label.text = f"导出成功！\n文件保存至：{full_path}"
             self.tip_label.color = (0, 0.7, 0, 1)
+
         except Exception as e:
+            logging.exception("导出失败")
             self.tip_label.text = f"导出失败：{str(e)}"
-            self.tip_label.color = (1, 0, 0, 1)
+            self.tip_label.color = COLOR_RED
         finally:
             conn.close()
 
     def go_back(self, instance):
         self.manager.current = 'main'
-
 
 # ---------- 应用入口 ----------
 class MyApp(App):
@@ -1629,10 +1597,11 @@ class MyApp(App):
         if self.current_bill is None or self.current_bill not in self.bill_files:
             self.current_bill = self.bill_files[0]
 
-    def create_new_bill(self, name):
-        if not name.strip():
+    def create_new_bill(self, raw_name):
+        if not raw_name.strip():
             return False, "文件名不能为空"
-        filename = name.strip() + '.db'
+        safe_name = sanitize_filename(raw_name.strip())
+        filename = safe_name + '.db'
         filepath = os.path.join(self.bills_dir, filename)
         if os.path.exists(filepath):
             return False, "文件已存在"
@@ -1641,10 +1610,10 @@ class MyApp(App):
         self.current_bill = filename
         return True, "创建成功"
 
-    def rename_current_bill(self, new_name):
+    def rename_current_bill(self, raw_name):
         if not self.current_bill:
             return False, "没有选中任何账单"
-        new_name = new_name.strip()
+        new_name = sanitize_filename(raw_name.strip())
         if not new_name:
             return False, "名称不能为空"
         if new_name.lower().endswith('.db'):
@@ -1659,6 +1628,7 @@ class MyApp(App):
         try:
             os.rename(old_path, new_path)
         except Exception as e:
+            logging.exception("重命名失败")
             return False, f"重命名失败：{str(e)}"
         self.current_bill = new_filename
         self.refresh_bill_list()
@@ -1673,6 +1643,7 @@ class MyApp(App):
         try:
             os.remove(filepath)
         except Exception as e:
+            logging.exception("删除失败")
             return False, f"删除失败：{str(e)}"
         self.refresh_bill_list()
         self.current_bill = self.bill_files[0]
@@ -1681,7 +1652,5 @@ class MyApp(App):
     def get_current_db_path(self):
         return os.path.join(self.bills_dir, self.current_bill)
 
-
 if __name__ == '__main__':
-
     MyApp().run()
