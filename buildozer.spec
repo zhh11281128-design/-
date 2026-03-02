@@ -37,16 +37,17 @@ android.ndk = 25b
 # (str) 构建工具版本（与工作流中一致）
 android.build_tools = 34.0.0
 
-# (list) 权限
-android.permissions = INTERNET
-
 # (bool) 启用 AndroidX
 android.use_support_library = True
 
 # (str) 可选：指定 SDK 路径（由环境变量覆盖，这里留空）
 # android.sdk_path = 
 # android.ndk_path = 
+# 强制竖屏
+android.orientation = portrait
 
+# 添加存储权限（读写外部存储）
+android.permissions = INTERNET, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE
 [buildozer]
 log_level = 2
 warn_on_root = 1
