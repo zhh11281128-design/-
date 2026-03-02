@@ -13,7 +13,7 @@ android.ndk_path = /usr/local/lib/android/sdk/ndk/25.2.9519653
 version = 0.1
 
 # (list) 应用依赖的 Python 模块（根据 import 添加）
-requirements = python3,kivy,plyer,openpyxl
+requirements = python3,kivy,plyer,openpyxl,android
 
 # (str) 源代码目录
 source.dir = .
