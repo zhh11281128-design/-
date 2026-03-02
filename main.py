@@ -1,5 +1,6 @@
 import datetime
 import os
+os.environ['KIVY_GL_BACKEND'] = 'angle_sdl2'
 import sys
 import sqlite3
 from openpyxl import Workbook, load_workbook
@@ -1682,4 +1683,5 @@ class MyApp(App):
 
 
 if __name__ == '__main__':
+
     MyApp().run()
